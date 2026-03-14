@@ -31,6 +31,10 @@ struct Cli {
     /// Directory for rotating log files (enables file logging in addition to stdout)
     #[arg(long, value_name = "PATH")]
     logs_root: Option<PathBuf>,
+
+    /// Acknowledge that this is an engineering preview running without usual guardrails
+    #[arg(long = "i-understand-that-this-will-be-running-without-the-usual-guardrails")]
+    guardrails_acknowledged: bool,
 }
 
 #[tokio::main]
@@ -38,6 +42,11 @@ async fn main() {
     dotenvy::dotenv().ok();
 
     let cli = Cli::parse();
+
+    if !cli.guardrails_acknowledged {
+        eprintln!("{}", acknowledgement_banner());
+        std::process::exit(1);
+    }
 
     // Hold the guard for the lifetime of the application so file logs are flushed.
     let _log_guard = if let Some(ref logs_root) = cli.logs_root {
@@ -177,4 +186,27 @@ fn init_tracing() {
         .with_target(false)
         .compact()
         .init();
+}
+
+fn acknowledgement_banner() -> String {
+    let lines = [
+        "This Symphony implementation is a low key engineering preview.",
+        "Codex will run without any guardrails.",
+        "Symphony is not a supported product and is presented as-is.",
+        "To proceed, start with `--i-understand-that-this-will-be-running-without-the-usual-guardrails` CLI argument",
+    ];
+    let width = lines.iter().map(|l| l.len()).max().unwrap_or(0);
+    let border: String = std::iter::repeat('─').take(width + 2).collect();
+    let top = format!("╭{border}╮");
+    let bottom = format!("╰{border}╯");
+    let spacer = format!("│ {:width$} │", "", width = width);
+
+    let mut content = vec![top, spacer.clone()];
+    for line in &lines {
+        content.push(format!("│ {:width$} │", line, width = width));
+    }
+    content.push(spacer);
+    content.push(bottom);
+
+    format!("\x1b[91;1m{}\x1b[0m", content.join("\n"))
 }
