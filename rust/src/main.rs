@@ -27,6 +27,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
     init_tracing();
 
     let cli = Cli::parse();
