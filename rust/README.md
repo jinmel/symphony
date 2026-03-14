@@ -60,6 +60,12 @@ symphony [OPTIONS] [WORKFLOW]
 | `WORKFLOW` | `WORKFLOW.md` | Path to the workflow file. |
 | `--api-key` | `$LINEAR_API_KEY` | Linear API key. Overrides `tracker.api_key` in WORKFLOW.md. Also reads from the `LINEAR_API_KEY` environment variable. |
 | `--port` | _(none)_ | Port for the optional server. Overrides `server.port` in WORKFLOW.md. |
+| `--project-slug` | `$LINEAR_PROJECT_SLUG` | Linear project slug. Overrides `tracker.project_slug` in WORKFLOW.md. |
+| `--workspace-root` | `$SYMPHONY_WORKSPACE_ROOT` | Root directory for per-issue workspaces. Overrides `workspace.root` in WORKFLOW.md. |
+| `--codex-command` | `$CODEX_COMMAND` | Command to launch the Codex app-server. Overrides `codex.command` in WORKFLOW.md. |
+| `--assignee` | `$LINEAR_ASSIGNEE` | Linear assignee filter. Overrides `tracker.assignee` in WORKFLOW.md. |
+| `--max-concurrent-agents` | _(none)_ | Maximum number of concurrent agents. Overrides `agent.max_concurrent_agents` in WORKFLOW.md. |
+| `--polling-interval-ms` | _(none)_ | Polling interval in milliseconds. Overrides `polling.interval_ms` in WORKFLOW.md. |
 | `--version` | | Print version and exit. |
 | `--help` | | Print help and exit. |
 
@@ -75,6 +81,14 @@ cargo run --release -- --api-key lin_api_... /path/to/WORKFLOW.md
 
 # Or run the compiled binary directly:
 ./target/release/symphony --api-key lin_api_... --port 4000 /path/to/WORKFLOW.md
+
+# Override operational settings via flags:
+./target/release/symphony \
+  --project-slug my-project \
+  --workspace-root /data/workspaces \
+  --max-concurrent-agents 20 \
+  --polling-interval-ms 10000 \
+  /path/to/WORKFLOW.md
 ```
 
 Symphony runs as a long-lived daemon. Press `Ctrl-C` to trigger a graceful shutdown.

@@ -97,6 +97,12 @@ pub struct ObservabilityConfig {
 pub struct CliOverrides {
     pub api_key: Option<String>,
     pub port: Option<u16>,
+    pub project_slug: Option<String>,
+    pub workspace_root: Option<PathBuf>,
+    pub codex_command: Option<String>,
+    pub assignee: Option<String>,
+    pub max_concurrent_agents: Option<usize>,
+    pub polling_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -404,6 +410,24 @@ impl EffectiveConfig {
         }
         if let Some(port) = overrides.port {
             self.server.port = Some(port);
+        }
+        if let Some(ref project_slug) = overrides.project_slug {
+            self.tracker.project_slug = Some(project_slug.clone());
+        }
+        if let Some(ref workspace_root) = overrides.workspace_root {
+            self.workspace.root = workspace_root.clone();
+        }
+        if let Some(ref codex_command) = overrides.codex_command {
+            self.codex.command = codex_command.clone();
+        }
+        if let Some(ref assignee) = overrides.assignee {
+            self.tracker.assignee = Some(assignee.clone());
+        }
+        if let Some(max_concurrent_agents) = overrides.max_concurrent_agents {
+            self.agent.max_concurrent_agents = max_concurrent_agents;
+        }
+        if let Some(polling_interval_ms) = overrides.polling_interval_ms {
+            self.polling.interval_ms = polling_interval_ms;
         }
     }
 
@@ -743,6 +767,77 @@ tracker:
             JsonValue::String(ref v) if v == "never"
         );
         assert!(!is_auto_approve);
+    }
+
+    #[test]
+    fn apply_overrides_sets_all_fields() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Mapping>(
+            r#"
+tracker:
+  kind: linear
+  project_slug: demo
+"#,
+        )
+        .unwrap();
+
+        let mut config = EffectiveConfig::from_workflow_config(&yaml).unwrap();
+        let overrides = CliOverrides {
+            api_key: Some("override-key".to_owned()),
+            port: Some(9090),
+            project_slug: Some("override-slug".to_owned()),
+            workspace_root: Some(PathBuf::from("/tmp/override")),
+            codex_command: Some("my-codex app-server".to_owned()),
+            assignee: Some("user-42".to_owned()),
+            max_concurrent_agents: Some(5),
+            polling_interval_ms: Some(1000),
+        };
+        config.apply_overrides(&overrides);
+
+        assert_eq!(config.tracker.api_key.as_deref(), Some("override-key"));
+        assert_eq!(config.server.port, Some(9090));
+        assert_eq!(
+            config.tracker.project_slug.as_deref(),
+            Some("override-slug")
+        );
+        assert_eq!(config.workspace.root, PathBuf::from("/tmp/override"));
+        assert_eq!(config.codex.command, "my-codex app-server");
+        assert_eq!(config.tracker.assignee.as_deref(), Some("user-42"));
+        assert_eq!(config.agent.max_concurrent_agents, 5);
+        assert_eq!(config.polling.interval_ms, 1000);
+    }
+
+    #[test]
+    fn apply_overrides_default_is_noop() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Mapping>(
+            r#"
+tracker:
+  kind: linear
+  project_slug: demo
+"#,
+        )
+        .unwrap();
+
+        let config_before = EffectiveConfig::from_workflow_config(&yaml).unwrap();
+        let mut config_after = EffectiveConfig::from_workflow_config(&yaml).unwrap();
+        config_after.apply_overrides(&CliOverrides::default());
+
+        assert_eq!(config_before.tracker.api_key, config_after.tracker.api_key);
+        assert_eq!(config_before.server.port, config_after.server.port);
+        assert_eq!(
+            config_before.tracker.project_slug,
+            config_after.tracker.project_slug
+        );
+        assert_eq!(config_before.workspace.root, config_after.workspace.root);
+        assert_eq!(config_before.codex.command, config_after.codex.command);
+        assert_eq!(config_before.tracker.assignee, config_after.tracker.assignee);
+        assert_eq!(
+            config_before.agent.max_concurrent_agents,
+            config_after.agent.max_concurrent_agents
+        );
+        assert_eq!(
+            config_before.polling.interval_ms,
+            config_after.polling.interval_ms
+        );
     }
 
     #[test]

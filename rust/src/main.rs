@@ -35,6 +35,30 @@ struct Cli {
     /// Acknowledge that this is an engineering preview running without usual guardrails
     #[arg(long = "i-understand-that-this-will-be-running-without-the-usual-guardrails")]
     guardrails_acknowledged: bool,
+
+    /// Linear project slug (overrides tracker.project_slug in WORKFLOW.md)
+    #[arg(long, env = "LINEAR_PROJECT_SLUG")]
+    project_slug: Option<String>,
+
+    /// Root directory for per-issue workspaces (overrides workspace.root in WORKFLOW.md)
+    #[arg(long, env = "SYMPHONY_WORKSPACE_ROOT")]
+    workspace_root: Option<PathBuf>,
+
+    /// Command to launch the Codex app-server (overrides codex.command in WORKFLOW.md)
+    #[arg(long, env = "CODEX_COMMAND")]
+    codex_command: Option<String>,
+
+    /// Linear assignee filter (overrides tracker.assignee in WORKFLOW.md)
+    #[arg(long, env = "LINEAR_ASSIGNEE")]
+    assignee: Option<String>,
+
+    /// Maximum number of concurrent agents (overrides agent.max_concurrent_agents in WORKFLOW.md)
+    #[arg(long)]
+    max_concurrent_agents: Option<usize>,
+
+    /// Polling interval in milliseconds (overrides polling.interval_ms in WORKFLOW.md)
+    #[arg(long)]
+    polling_interval_ms: Option<u64>,
 }
 
 #[tokio::main]
@@ -69,9 +93,25 @@ async fn main() {
         std::process::exit(1);
     }
 
+    let workspace_root = cli.workspace_root.map(|p| {
+        if p.is_absolute() {
+            p
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(p)
+        }
+    });
+
     let overrides = CliOverrides {
         api_key: cli.api_key,
         port: cli.port,
+        project_slug: cli.project_slug,
+        workspace_root,
+        codex_command: cli.codex_command,
+        assignee: cli.assignee,
+        max_concurrent_agents: cli.max_concurrent_agents,
+        polling_interval_ms: cli.polling_interval_ms,
     };
 
     let workflow_store = match WorkflowStore::open(workflow_path, overrides).await {
