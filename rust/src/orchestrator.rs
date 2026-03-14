@@ -1022,8 +1022,10 @@ mod tests {
             state: "Todo".to_owned(),
             branch_name: None,
             url: None,
+            assignee_id: None,
             labels: vec![],
             blocked_by: vec![],
+            assigned_to_worker: true,
             created_at: Some(Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap()),
             updated_at: None,
         };

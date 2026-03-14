@@ -804,4 +804,145 @@ mod tests {
         });
         assert!(needs_input("turn/updated", &payload));
     }
+
+    #[test]
+    fn dynamic_tool_specs_contains_linear_graphql() {
+        let specs = dynamic_tool_specs();
+        let tools = specs.as_array().expect("should be an array");
+        assert_eq!(tools.len(), 1);
+        let tool = &tools[0];
+        assert_eq!(tool.get("name").and_then(Value::as_str), Some("linear_graphql"));
+        let schema = tool.get("inputSchema").expect("should have inputSchema");
+        let required = schema.get("required").and_then(Value::as_array).expect("should have required");
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0].as_str(), Some("query"));
+        let props = schema.get("properties").and_then(Value::as_object).expect("should have properties");
+        assert!(props.contains_key("query"));
+        assert!(props.contains_key("variables"));
+    }
+
+    #[test]
+    fn tool_error_response_returns_structured_json() {
+        let result = tool_error_response("test error");
+        assert_eq!(result.get("success").and_then(Value::as_bool), Some(false));
+        let output = result.get("output").and_then(Value::as_str).expect("should have output");
+        assert!(output.contains("test error"));
+        let items = result.get("contentItems").and_then(Value::as_array).expect("should have contentItems");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].get("type").and_then(Value::as_str), Some("inputText"));
+    }
+
+    #[tokio::test]
+    async fn execute_linear_graphql_tool_missing_query_in_object() {
+        let config = test_config();
+        let result = execute_linear_graphql_tool(&config, json!({"variables": {}})).await;
+        assert_eq!(result.get("success").and_then(Value::as_bool), Some(false));
+        let output = result.get("output").and_then(Value::as_str).unwrap();
+        assert!(output.contains("requires a non-empty `query` string"));
+    }
+
+    #[tokio::test]
+    async fn execute_linear_graphql_tool_empty_string_query() {
+        let config = test_config();
+        let result = execute_linear_graphql_tool(&config, json!("   ")).await;
+        assert_eq!(result.get("success").and_then(Value::as_bool), Some(false));
+        let output = result.get("output").and_then(Value::as_str).unwrap();
+        assert!(output.contains("requires a non-empty `query` string"));
+    }
+
+    #[tokio::test]
+    async fn execute_linear_graphql_tool_invalid_variables() {
+        let config = test_config();
+        let result = execute_linear_graphql_tool(
+            &config,
+            json!({"query": "{ viewer { id } }", "variables": "not_an_object"}),
+        )
+        .await;
+        assert_eq!(result.get("success").and_then(Value::as_bool), Some(false));
+        let output = result.get("output").and_then(Value::as_str).unwrap();
+        assert!(output.contains("must be a JSON object"));
+    }
+
+    #[tokio::test]
+    async fn execute_linear_graphql_tool_invalid_argument_type() {
+        let config = test_config();
+        let result = execute_linear_graphql_tool(&config, json!(42)).await;
+        assert_eq!(result.get("success").and_then(Value::as_bool), Some(false));
+        let output = result.get("output").and_then(Value::as_str).unwrap();
+        assert!(output.contains("expects either a GraphQL query string"));
+    }
+
+    #[tokio::test]
+    async fn execute_linear_graphql_tool_missing_api_key() {
+        let mut config = test_config();
+        config.tracker.api_key = None;
+        let result = execute_linear_graphql_tool(
+            &config,
+            json!({"query": "{ viewer { id } }"}),
+        )
+        .await;
+        assert_eq!(result.get("success").and_then(Value::as_bool), Some(false));
+        let output = result.get("output").and_then(Value::as_str).unwrap();
+        assert!(output.contains("missing Linear auth"));
+    }
+
+    #[tokio::test]
+    async fn execute_linear_graphql_tool_null_variables_treated_as_empty() {
+        // This test validates that null variables don't cause an error.
+        // The actual API call will fail (no real endpoint), but it should
+        // get past argument validation.
+        let mut config = test_config();
+        config.tracker.api_key = None; // intentionally missing to fail early
+        let result = execute_linear_graphql_tool(
+            &config,
+            json!({"query": "{ viewer { id } }", "variables": null}),
+        )
+        .await;
+        // Should fail on missing API key, not on variable validation
+        let output = result.get("output").and_then(Value::as_str).unwrap();
+        assert!(output.contains("missing Linear auth"));
+    }
+
+    fn test_config() -> EffectiveConfig {
+        EffectiveConfig {
+            tracker: crate::config::TrackerConfig {
+                kind: Some("linear".to_owned()),
+                endpoint: "https://api.linear.app/graphql".to_owned(),
+                api_key: Some("test-token".to_owned()),
+                project_slug: Some("demo".to_owned()),
+                assignee: None,
+                active_states: vec!["Todo".to_owned()],
+                terminal_states: vec!["Done".to_owned()],
+            },
+            polling: crate::config::PollingConfig {
+                interval_ms: 30_000,
+            },
+            workspace: crate::config::WorkspaceConfig {
+                root: std::path::PathBuf::from("/tmp/test"),
+            },
+            hooks: crate::config::HooksConfig {
+                after_create: None,
+                before_run: None,
+                after_run: None,
+                before_remove: None,
+                timeout_ms: 1_000,
+            },
+            agent: crate::config::AgentConfig {
+                max_concurrent_agents: 1,
+                max_turns: 1,
+                max_retry_backoff_ms: 1_000,
+                max_concurrent_agents_by_state: Default::default(),
+            },
+            codex: crate::config::CodexConfig {
+                command: "echo test".to_owned(),
+                approval_policy: json!("never"),
+                thread_sandbox: "workspace-write".to_owned(),
+                turn_sandbox_policy: None,
+                turn_timeout_ms: 60_000,
+                read_timeout_ms: 5_000,
+                stall_timeout_ms: 300_000,
+            },
+            server: crate::config::ServerConfig { port: None },
+        }
+    }
 }
