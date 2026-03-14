@@ -302,6 +302,7 @@ mod tests {
                 endpoint: "https://api.linear.app/graphql".to_owned(),
                 api_key: Some("token".to_owned()),
                 project_slug: Some("demo".to_owned()),
+                assignee: None,
                 active_states: vec!["Todo".to_owned()],
                 terminal_states: vec!["Done".to_owned()],
             },

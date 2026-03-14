@@ -250,7 +250,12 @@ impl LinearTrackerClient {
                 .and_then(Value::as_array)
                 .ok_or(TrackerError::LinearUnknownPayload)?;
 
-            issues.extend(issue_nodes.iter().filter_map(normalize_issue));
+            // No assignee filter for state-based queries (used for terminal cleanup)
+            issues.extend(
+                issue_nodes
+                    .iter()
+                    .filter_map(|v| normalize_issue(v, None)),
+            );
 
             let page_info = body
                 .pointer("/data/issues/pageInfo")
@@ -286,6 +291,7 @@ impl LinearTrackerClient {
             return Ok(Vec::new());
         }
 
+        let resolved_assignee = self.resolve_assignee_filter(config).await?;
         let mut issues = Vec::new();
         for batch in ids.chunks(ISSUE_PAGE_SIZE) {
             let body = self
@@ -304,7 +310,11 @@ impl LinearTrackerClient {
                 .pointer("/data/issues/nodes")
                 .and_then(Value::as_array)
                 .ok_or(TrackerError::LinearUnknownPayload)?;
-            issues.extend(nodes.iter().filter_map(normalize_issue));
+            issues.extend(
+                nodes
+                    .iter()
+                    .filter_map(|v| normalize_issue(v, resolved_assignee.as_deref())),
+            );
         }
 
         let order_index: HashMap<&str, usize> = ids
@@ -532,10 +542,71 @@ mod tests {
             },
             "createdAt": "2026-03-14T00:00:00Z",
             "updatedAt": "2026-03-14T00:00:00Z"
-        }))
+        }), None)
         .unwrap();
 
         assert_eq!(issue.labels, vec!["bug"]);
         assert_eq!(issue.blocked_by.len(), 1);
+        assert!(issue.assigned_to_worker);
+        assert_eq!(issue.assignee_id, None);
+    }
+
+    #[test]
+    fn assignee_filtering_matches_correct_user() {
+        let issue_json = json!({
+            "id": "1",
+            "identifier": "ABC-1",
+            "title": "Test",
+            "description": null,
+            "priority": 2,
+            "state": { "name": "Todo" },
+            "branchName": null,
+            "url": null,
+            "assignee": { "id": "user-123" },
+            "labels": { "nodes": [] },
+            "inverseRelations": { "nodes": [] },
+            "createdAt": "2026-03-14T00:00:00Z",
+            "updatedAt": "2026-03-14T00:00:00Z"
+        });
+
+        // No filter => assigned_to_worker is true
+        let issue = normalize_issue(&issue_json, None).unwrap();
+        assert!(issue.assigned_to_worker);
+        assert_eq!(issue.assignee_id.as_deref(), Some("user-123"));
+
+        // Matching filter => assigned_to_worker is true
+        let issue = normalize_issue(&issue_json, Some("user-123")).unwrap();
+        assert!(issue.assigned_to_worker);
+
+        // Non-matching filter => assigned_to_worker is false
+        let issue = normalize_issue(&issue_json, Some("user-999")).unwrap();
+        assert!(!issue.assigned_to_worker);
+    }
+
+    #[test]
+    fn assignee_filtering_unassigned_issue() {
+        let issue_json = json!({
+            "id": "1",
+            "identifier": "ABC-1",
+            "title": "Test",
+            "description": null,
+            "priority": 2,
+            "state": { "name": "Todo" },
+            "branchName": null,
+            "url": null,
+            "assignee": null,
+            "labels": { "nodes": [] },
+            "inverseRelations": { "nodes": [] },
+            "createdAt": "2026-03-14T00:00:00Z",
+            "updatedAt": "2026-03-14T00:00:00Z"
+        });
+
+        // No filter => assigned_to_worker is true
+        let issue = normalize_issue(&issue_json, None).unwrap();
+        assert!(issue.assigned_to_worker);
+
+        // With filter but no assignee => not assigned to worker
+        let issue = normalize_issue(&issue_json, Some("user-123")).unwrap();
+        assert!(!issue.assigned_to_worker);
     }
 }

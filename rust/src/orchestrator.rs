@@ -298,6 +298,15 @@ impl Orchestrator {
                     );
                     self.mark_running_for_stop(&issue.id, true, true, None);
                 }
+                Some(issue) if !issue.assigned_to_worker => {
+                    info!(
+                        issue_id = %issue.id,
+                        issue_identifier = %issue.identifier,
+                        assignee_id = issue.assignee_id.as_deref().unwrap_or("none"),
+                        "issue no longer routed to this worker; stopping agent"
+                    );
+                    self.mark_running_for_stop(&issue.id, true, false, None);
+                }
                 Some(issue) if active_states.contains(&normalize_issue_state(&issue.state)) => {
                     if let Some(entry) = self.state.running.get_mut(&issue.id) {
                         entry.issue = issue.clone();
@@ -372,6 +381,10 @@ impl Orchestrator {
 
     fn should_dispatch_issue(&self, issue: &Issue, config: &EffectiveConfig) -> bool {
         if !issue.has_required_dispatch_fields() {
+            return false;
+        }
+
+        if !issue.assigned_to_worker {
             return false;
         }
 
@@ -1022,8 +1035,10 @@ mod tests {
             state: "Todo".to_owned(),
             branch_name: None,
             url: None,
+            assignee_id: None,
             labels: vec![],
             blocked_by: vec![],
+            assigned_to_worker: false,
             created_at: Some(Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap()),
             updated_at: None,
         };
