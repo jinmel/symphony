@@ -942,7 +942,16 @@ mod tests {
                 read_timeout_ms: 5_000,
                 stall_timeout_ms: 300_000,
             },
-            server: crate::config::ServerConfig { port: None },
+            server: crate::config::ServerConfig {
+                port: None,
+                host: "127.0.0.1".to_owned(),
+            },
+            worker: crate::worker::WorkerConfig::default(),
+            observability: crate::config::ObservabilityConfig {
+                dashboard_enabled: true,
+                refresh_ms: 1_000,
+                render_interval_ms: 16,
+            },
         }
     }
 }

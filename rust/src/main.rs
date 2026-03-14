@@ -6,7 +6,11 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use symphony::config::CliOverrides;
-use symphony::orchestrator::Orchestrator;
+use symphony::dashboard::{DashboardConfig, DashboardState, StatusDashboard};
+use symphony::log_file::{self, LogFileConfig};
+use symphony::orchestrator::{ObservabilityHandles, Orchestrator};
+use symphony::pubsub::ObservabilityBus;
+use symphony::server::{ObservabilityServer, SharedSnapshot};
 use symphony::workflow::WorkflowStore;
 
 #[derive(Debug, Parser)]
@@ -23,14 +27,26 @@ struct Cli {
     /// Port for the optional server
     #[arg(long)]
     port: Option<u16>,
+
+    /// Directory for rotating log files (enables file logging in addition to stdout)
+    #[arg(long, value_name = "PATH")]
+    logs_root: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-    init_tracing();
 
     let cli = Cli::parse();
+
+    // Hold the guard for the lifetime of the application so file logs are flushed.
+    let _log_guard = if let Some(ref logs_root) = cli.logs_root {
+        let config = LogFileConfig::new(logs_root);
+        Some(log_file::init_file_logging(&config))
+    } else {
+        init_tracing();
+        None
+    };
     let workflow_path = if cli.workflow_path.is_absolute() {
         cli.workflow_path
     } else {
@@ -59,9 +75,56 @@ async fn main() {
 
     let _watch_task = workflow_store.start_polling();
     let shutdown = CancellationToken::new();
-    let shutdown_signal = shutdown.clone();
 
-    let orchestrator = Orchestrator::new(workflow_store);
+    // -----------------------------------------------------------------------
+    // Observability subsystems
+    // -----------------------------------------------------------------------
+
+    // Shared snapshot for the HTTP server.
+    let shared_snapshot = SharedSnapshot::default();
+
+    // PubSub bus for broadcast observability events.
+    let bus = ObservabilityBus::default();
+
+    // Dashboard watch channel.
+    let (dashboard_tx, dashboard_rx) = tokio::sync::watch::channel(DashboardState::default());
+
+    // -- HTTP observability server -------------------------------------------
+    // Read the server port from the workflow config; the CLI --port flag will
+    // have been folded in via CliOverrides already.
+    let server_port = {
+        let runtime = workflow_store.current().await;
+        runtime.config.server.port
+    };
+
+    if let Some(port) = server_port.filter(|p| *p > 0) {
+        let server = ObservabilityServer::new("0.0.0.0", port, shared_snapshot.clone(), shutdown.clone());
+        tokio::spawn(async move {
+            if let Err(error) = server.run().await {
+                eprintln!("Observability server error: {error}");
+            }
+        });
+    }
+
+    // -- Terminal dashboard --------------------------------------------------
+    let dashboard = StatusDashboard::new(DashboardConfig::default(), dashboard_rx);
+    let dashboard_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        dashboard.run(dashboard_shutdown).await;
+    });
+
+    // -----------------------------------------------------------------------
+    // Orchestrator
+    // -----------------------------------------------------------------------
+
+    let observability = ObservabilityHandles {
+        bus: Some(bus),
+        shared_snapshot: Some(shared_snapshot),
+        dashboard_tx: Some(dashboard_tx),
+    };
+
+    let shutdown_signal = shutdown.clone();
+    let orchestrator = Orchestrator::new(workflow_store, observability);
     let mut orchestrator_task =
         tokio::spawn(async move { orchestrator.run(shutdown_signal).await });
 
@@ -85,8 +148,15 @@ async fn main() {
                 std::process::exit(1);
             }
             shutdown.cancel();
+
+            // Render an offline status message before exiting.
+            eprintln!("\nSymphony shutting down...");
+
             match orchestrator_task.await {
-                Ok(Ok(())) => std::process::exit(0),
+                Ok(Ok(())) => {
+                    eprintln!("Symphony offline.");
+                    std::process::exit(0);
+                }
                 Ok(Err(error)) => {
                     eprintln!("Symphony exited with error: {error}");
                     std::process::exit(1);

@@ -7,14 +7,20 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::agent::{AgentError, AgentUpdate, AppServerSession};
 use crate::config::{ConfigError, EffectiveConfig, normalize_issue_state};
+use crate::dashboard::{
+    self, DashboardState, RateLimitInfo as DashboardRateLimitInfo, ThroughputTracker,
+};
 use crate::issue::Issue;
 use crate::prompt::{PromptError, build_prompt, continuation_prompt};
+use crate::pubsub::{self, ObservabilityBus, OrchestratorSnapshot as PubSubSnapshot};
+use crate::server::{self, OrchestratorSnapshot as ServerSnapshot, SharedSnapshot};
 use crate::tracker::{TrackerClient, TrackerError};
 use crate::workflow::{WorkflowRuntime, WorkflowStore, WorkflowStoreError};
 use crate::workspace::{
@@ -33,6 +39,39 @@ pub enum OrchestratorError {
     Config(#[from] ConfigError),
 }
 
+/// Handles to observability subsystems that the orchestrator pushes state into.
+///
+/// All fields are optional so that the orchestrator can run in a "headless"
+/// mode (e.g. in tests) without any observability wiring.
+pub struct ObservabilityHandles {
+    /// Broadcast bus for observability events (pubsub subscribers).
+    pub bus: Option<ObservabilityBus>,
+    /// Shared snapshot consumed by the HTTP server.
+    pub shared_snapshot: Option<SharedSnapshot>,
+    /// Watch channel sender for the terminal dashboard.
+    pub dashboard_tx: Option<watch::Sender<DashboardState>>,
+}
+
+impl std::fmt::Debug for ObservabilityHandles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObservabilityHandles")
+            .field("bus", &self.bus.is_some())
+            .field("shared_snapshot", &self.shared_snapshot.is_some())
+            .field("dashboard_tx", &self.dashboard_tx.is_some())
+            .finish()
+    }
+}
+
+impl Default for ObservabilityHandles {
+    fn default() -> Self {
+        Self {
+            bus: None,
+            shared_snapshot: None,
+            dashboard_tx: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Orchestrator {
     workflow_store: Arc<WorkflowStore>,
@@ -40,6 +79,8 @@ pub struct Orchestrator {
     tx: UnboundedSender<OrchestratorEvent>,
     rx: UnboundedReceiver<OrchestratorEvent>,
     state: OrchestratorState,
+    observability: ObservabilityHandles,
+    started_at: Instant,
 }
 
 #[derive(Debug)]
@@ -54,6 +95,7 @@ struct OrchestratorState {
     codex_totals: AggregatedTotals,
     codex_rate_limits: Option<Value>,
     retry_token_counter: u64,
+    throughput_tracker: ThroughputTracker,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -131,7 +173,7 @@ enum OrchestratorEvent {
 }
 
 impl Orchestrator {
-    pub fn new(workflow_store: Arc<WorkflowStore>) -> Self {
+    pub fn new(workflow_store: Arc<WorkflowStore>, observability: ObservabilityHandles) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         Self {
             workflow_store,
@@ -149,7 +191,10 @@ impl Orchestrator {
                 codex_totals: AggregatedTotals::default(),
                 codex_rate_limits: None,
                 retry_token_counter: 0,
+                throughput_tracker: ThroughputTracker::new(),
             },
+            observability,
+            started_at: Instant::now(),
         }
     }
 
@@ -159,6 +204,9 @@ impl Orchestrator {
         self.refresh_runtime_config(&startup_runtime.config);
         self.startup_terminal_workspace_cleanup(&startup_runtime.config)
             .await;
+
+        // Publish initial state.
+        self.publish_state().await;
 
         let mut next_tick = Instant::now();
 
@@ -170,10 +218,12 @@ impl Orchestrator {
                 }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_tick)) => {
                     self.handle_tick().await;
+                    self.publish_state().await;
                     next_tick = Instant::now() + Duration::from_millis(self.state.poll_interval_ms);
                 }
                 Some(event) = self.rx.recv() => {
                     self.handle_event(event).await;
+                    self.publish_state().await;
                 }
             }
         }
@@ -758,6 +808,218 @@ impl Orchestrator {
                 handle,
             },
         );
+    }
+
+    /// Build a pubsub snapshot from the current orchestrator state and push it
+    /// to all observability sinks (bus, shared snapshot, dashboard channel).
+    async fn publish_state(&mut self) {
+        let now = Utc::now();
+        let uptime = self.started_at.elapsed();
+
+        // Record throughput sample before building dashboard state.
+        self.state
+            .throughput_tracker
+            .record(self.state.codex_totals.total_tokens);
+
+        // -- Build pubsub snapshot -----------------------------------------------
+        let running: Vec<pubsub::RunningIssueInfo> = self
+            .state
+            .running
+            .values()
+            .map(|entry| {
+                let elapsed = now
+                    .signed_duration_since(entry.started_at)
+                    .num_seconds()
+                    .max(0) as u64;
+                pubsub::RunningIssueInfo {
+                    issue_id: entry.issue.id.clone(),
+                    identifier: entry.identifier.clone(),
+                    title: entry.issue.title.clone(),
+                    state: entry.issue.state.clone(),
+                    workspace_path: entry.workspace_path.clone(),
+                    session_id: entry.session_id.clone(),
+                    tokens_used: entry.codex_total_tokens,
+                    turn_count: entry.turn_count,
+                    started_at: entry.started_at,
+                    elapsed_seconds: elapsed,
+                }
+            })
+            .collect();
+
+        let retrying: Vec<pubsub::RetryingIssueInfo> = self
+            .state
+            .retry_attempts
+            .iter()
+            .map(|(issue_id, entry)| {
+                let remaining = entry.due_at.saturating_duration_since(Instant::now());
+                let next_retry_at = now + chrono::Duration::from_std(remaining).unwrap_or_default();
+                pubsub::RetryingIssueInfo {
+                    issue_id: issue_id.clone(),
+                    identifier: entry.identifier.clone(),
+                    attempt_count: entry.attempt,
+                    next_retry_at,
+                    last_error: entry.error.clone(),
+                }
+            })
+            .collect();
+
+        let pubsub_snapshot = PubSubSnapshot {
+            running,
+            retrying,
+            token_totals: pubsub::TokenTotals {
+                input_tokens: self.state.codex_totals.input_tokens,
+                output_tokens: self.state.codex_totals.output_tokens,
+                total_tokens: self.state.codex_totals.total_tokens,
+            },
+            rate_limits: self
+                .state
+                .codex_rate_limits
+                .as_ref()
+                .map(|raw| pubsub::RateLimitInfo { raw: raw.clone() }),
+            timestamp: now,
+        };
+
+        // -- Publish to bus ------------------------------------------------------
+        if let Some(ref bus) = self.observability.bus {
+            bus.publish_snapshot(pubsub_snapshot.clone());
+        }
+
+        // -- Update shared snapshot for the HTTP server --------------------------
+        if let Some(ref shared) = self.observability.shared_snapshot {
+            let server_snap = self.build_server_snapshot(now);
+            shared.set(server_snap).await;
+        }
+
+        // -- Send to dashboard watch channel -------------------------------------
+        if self.observability.dashboard_tx.is_some() {
+            let dash_state = self.build_dashboard_state(now, uptime);
+            // Best-effort send; if no receiver, this is a no-op.
+            if let Some(ref tx) = self.observability.dashboard_tx {
+                let _ = tx.send(dash_state);
+            }
+        }
+    }
+
+    /// Build a server-module snapshot directly from orchestrator state,
+    /// including per-entry details (last_event, tokens breakdown, etc.).
+    fn build_server_snapshot(&self, now: DateTime<Utc>) -> ServerSnapshot {
+        let running = self
+            .state
+            .running
+            .values()
+            .map(|entry| server::RunningIssueSnapshot {
+                issue_id: entry.issue.id.clone(),
+                issue_identifier: entry.identifier.clone(),
+                state: entry.issue.state.clone(),
+                worker_host: None,
+                workspace_path: Some(entry.workspace_path.clone()),
+                session_id: entry.session_id.clone(),
+                turn_count: entry.turn_count,
+                last_event: entry.last_codex_event.clone(),
+                last_message: entry.last_codex_message.clone(),
+                started_at: Some(entry.started_at),
+                last_event_at: entry.last_codex_timestamp,
+                tokens: server::TokenTotals {
+                    input_tokens: entry.codex_input_tokens,
+                    output_tokens: entry.codex_output_tokens,
+                    total_tokens: entry.codex_total_tokens,
+                },
+            })
+            .collect();
+
+        let retrying = self
+            .state
+            .retry_attempts
+            .iter()
+            .map(|(issue_id, entry)| {
+                let remaining = entry.due_at.saturating_duration_since(Instant::now());
+                let due_at = now + chrono::Duration::from_std(remaining).unwrap_or_default();
+                server::RetryingIssueSnapshot {
+                    issue_id: issue_id.clone(),
+                    issue_identifier: entry.identifier.clone(),
+                    attempt: entry.attempt,
+                    due_at: Some(due_at),
+                    error: entry.error.clone(),
+                    worker_host: None,
+                    workspace_path: None,
+                }
+            })
+            .collect();
+
+        ServerSnapshot {
+            running,
+            retrying,
+            codex_totals: server::TokenTotals {
+                input_tokens: self.state.codex_totals.input_tokens,
+                output_tokens: self.state.codex_totals.output_tokens,
+                total_tokens: self.state.codex_totals.total_tokens,
+            },
+            rate_limits: self.state.codex_rate_limits.clone(),
+        }
+    }
+
+    /// Build a dashboard state directly from orchestrator state,
+    /// including per-entry details.
+    fn build_dashboard_state(&mut self, now: DateTime<Utc>, uptime: Duration) -> DashboardState {
+        let running = self
+            .state
+            .running
+            .values()
+            .map(|entry| {
+                let elapsed = Duration::from_secs(
+                    now.signed_duration_since(entry.started_at)
+                        .num_seconds()
+                        .max(0) as u64,
+                );
+                dashboard::RunningAgentInfo {
+                    identifier: entry.identifier.clone(),
+                    title: entry.issue.title.clone(),
+                    state: entry.issue.state.clone(),
+                    elapsed,
+                    input_tokens: entry.codex_input_tokens,
+                    output_tokens: entry.codex_output_tokens,
+                    total_tokens: entry.codex_total_tokens,
+                    turn_count: entry.turn_count,
+                    last_event: entry.last_codex_event.clone(),
+                    last_message: entry.last_codex_message.clone(),
+                    session_id: entry.session_id.clone(),
+                }
+            })
+            .collect();
+
+        let retrying = self
+            .state
+            .retry_attempts
+            .iter()
+            .map(|(_issue_id, entry)| {
+                let remaining = entry.due_at.saturating_duration_since(Instant::now());
+                dashboard::RetryInfo {
+                    identifier: entry.identifier.clone(),
+                    next_retry_in: remaining,
+                    attempt: entry.attempt,
+                    error: entry.error.clone(),
+                }
+            })
+            .collect();
+
+        DashboardState {
+            running,
+            retrying,
+            token_totals: dashboard::TokenTotals {
+                input_tokens: self.state.codex_totals.input_tokens,
+                output_tokens: self.state.codex_totals.output_tokens,
+                total_tokens: self.state.codex_totals.total_tokens,
+            },
+            rate_limits: self.state.codex_rate_limits.as_ref().map(|raw| {
+                DashboardRateLimitInfo {
+                    raw: Some(raw.clone()),
+                }
+            }),
+            uptime,
+            max_agents: self.state.max_concurrent_agents,
+            throughput_tps: self.state.throughput_tracker.tokens_per_second(),
+            throughput_sparkline: self.state.throughput_tracker.sparkline_graph(),
+        }
     }
 
     fn available_slots(&self) -> usize {

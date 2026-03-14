@@ -6,6 +6,8 @@ use serde::Deserialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use thiserror::Error;
 
+use crate::worker;
+
 #[derive(Debug, Clone)]
 pub struct EffectiveConfig {
     pub tracker: TrackerConfig,
@@ -15,6 +17,8 @@ pub struct EffectiveConfig {
     pub agent: AgentConfig,
     pub codex: CodexConfig,
     pub server: ServerConfig,
+    pub worker: worker::WorkerConfig,
+    pub observability: ObservabilityConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -66,9 +70,26 @@ pub struct CodexConfig {
     pub stall_timeout_ms: i64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub port: Option<u16>,
+    pub host: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            port: None,
+            host: "127.0.0.1".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ObservabilityConfig {
+    pub dashboard_enabled: bool,
+    pub refresh_ms: u64,
+    pub render_interval_ms: u64,
 }
 
 /// CLI-level overrides that take precedence over WORKFLOW.md values.
@@ -106,6 +127,8 @@ struct RawConfig {
     agent: RawAgentConfig,
     codex: RawCodexConfig,
     server: RawServerConfig,
+    worker: WorkerRawConfig,
+    observability: ObservabilityRawConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -167,6 +190,22 @@ struct RawCodexConfig {
 #[serde(default)]
 struct RawServerConfig {
     port: Option<FlexibleInt>,
+    host: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct WorkerRawConfig {
+    ssh_hosts: Option<Vec<String>>,
+    max_concurrent_agents_per_host: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct ObservabilityRawConfig {
+    dashboard_enabled: Option<bool>,
+    refresh_ms: Option<FlexibleInt>,
+    render_interval_ms: Option<FlexibleInt>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -311,6 +350,35 @@ impl EffectiveConfig {
                 .as_ref()
                 .and_then(FlexibleInt::parse_i64)
                 .and_then(|value| u16::try_from(value).ok()),
+            host: raw
+                .server
+                .host
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "127.0.0.1".to_owned()),
+        };
+
+        let worker_config = worker::WorkerConfig {
+            hosts: raw
+                .worker
+                .ssh_hosts
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|h| !h.trim().is_empty())
+                .collect(),
+            per_host_concurrency: raw
+                .worker
+                .max_concurrent_agents_per_host
+                .filter(|&v| v > 0),
+        };
+
+        let observability = ObservabilityConfig {
+            dashboard_enabled: raw.observability.dashboard_enabled.unwrap_or(true),
+            refresh_ms: parse_positive_u64(raw.observability.refresh_ms.as_ref())
+                .unwrap_or(1_000),
+            render_interval_ms: parse_positive_u64(
+                raw.observability.render_interval_ms.as_ref(),
+            )
+            .unwrap_or(16),
         };
 
         Ok(Self {
@@ -325,6 +393,8 @@ impl EffectiveConfig {
             agent,
             codex,
             server,
+            worker: worker_config,
+            observability,
         })
     }
 
@@ -389,6 +459,10 @@ impl EffectiveConfig {
             .get(&normalized)
             .copied()
             .unwrap_or(self.agent.max_concurrent_agents)
+    }
+
+    pub fn server_host(&self) -> &str {
+        &self.server.host
     }
 
     pub fn resolved_turn_sandbox_policy(
@@ -691,5 +765,134 @@ codex:
             config.codex.approval_policy,
             JsonValue::String(ref v) if v == "never"
         ));
+    }
+
+    #[test]
+    fn worker_section_parses_ssh_hosts() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Mapping>(
+            r#"
+tracker:
+  kind: linear
+  project_slug: demo
+worker:
+  ssh_hosts: ["host1:22", "host2"]
+  max_concurrent_agents_per_host: 5
+"#,
+        )
+        .unwrap();
+
+        let config = EffectiveConfig::from_workflow_config(&yaml).unwrap();
+        assert_eq!(config.worker.hosts, vec!["host1:22", "host2"]);
+        assert_eq!(config.worker.per_host_concurrency, Some(5));
+    }
+
+    #[test]
+    fn worker_section_defaults_to_empty() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Mapping>(
+            r#"
+tracker:
+  kind: linear
+  project_slug: demo
+"#,
+        )
+        .unwrap();
+
+        let config = EffectiveConfig::from_workflow_config(&yaml).unwrap();
+        assert!(config.worker.hosts.is_empty());
+        assert!(config.worker.per_host_concurrency.is_none());
+    }
+
+    #[test]
+    fn worker_section_filters_blank_hosts() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Mapping>(
+            r#"
+tracker:
+  kind: linear
+  project_slug: demo
+worker:
+  ssh_hosts: ["host1", "  ", "", "host2"]
+  max_concurrent_agents_per_host: 0
+"#,
+        )
+        .unwrap();
+
+        let config = EffectiveConfig::from_workflow_config(&yaml).unwrap();
+        assert_eq!(config.worker.hosts, vec!["host1", "host2"]);
+        // 0 is filtered out (must be > 0)
+        assert_eq!(config.worker.per_host_concurrency, None);
+    }
+
+    #[test]
+    fn observability_section_parses_values() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Mapping>(
+            r#"
+tracker:
+  kind: linear
+  project_slug: demo
+observability:
+  dashboard_enabled: false
+  refresh_ms: 2000
+  render_interval_ms: 32
+"#,
+        )
+        .unwrap();
+
+        let config = EffectiveConfig::from_workflow_config(&yaml).unwrap();
+        assert!(!config.observability.dashboard_enabled);
+        assert_eq!(config.observability.refresh_ms, 2000);
+        assert_eq!(config.observability.render_interval_ms, 32);
+    }
+
+    #[test]
+    fn observability_section_defaults() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Mapping>(
+            r#"
+tracker:
+  kind: linear
+  project_slug: demo
+"#,
+        )
+        .unwrap();
+
+        let config = EffectiveConfig::from_workflow_config(&yaml).unwrap();
+        assert!(config.observability.dashboard_enabled);
+        assert_eq!(config.observability.refresh_ms, 1_000);
+        assert_eq!(config.observability.render_interval_ms, 16);
+    }
+
+    #[test]
+    fn server_host_defaults_to_localhost() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Mapping>(
+            r#"
+tracker:
+  kind: linear
+  project_slug: demo
+"#,
+        )
+        .unwrap();
+
+        let config = EffectiveConfig::from_workflow_config(&yaml).unwrap();
+        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(config.server_host(), "127.0.0.1");
+    }
+
+    #[test]
+    fn server_host_parsed_from_config() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Mapping>(
+            r#"
+tracker:
+  kind: linear
+  project_slug: demo
+server:
+  host: "0.0.0.0"
+  port: 8080
+"#,
+        )
+        .unwrap();
+
+        let config = EffectiveConfig::from_workflow_config(&yaml).unwrap();
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server_host(), "0.0.0.0");
+        assert_eq!(config.server.port, Some(8080));
     }
 }

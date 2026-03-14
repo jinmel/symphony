@@ -1,10 +1,17 @@
 pub mod agent;
 pub mod config;
+pub mod dashboard;
 pub mod error;
 pub mod issue;
+pub mod log_file;
 pub mod orchestrator;
 pub mod path_safety;
+pub mod pubsub;
 pub mod prompt;
+pub mod server;
+pub mod ssh;
 pub mod tracker;
+pub mod web_dashboard;
+pub mod worker;
 pub mod workflow;
 pub mod workspace;

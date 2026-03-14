@@ -8,7 +8,7 @@ use crate::config::{EffectiveConfig, normalize_issue_state};
 use crate::error::truncate_for_log;
 use crate::issue::{BlockerRef, Issue};
 
-use super::TrackerError;
+use super::{Tracker, TrackerError};
 
 const ISSUE_PAGE_SIZE: usize = 50;
 
@@ -82,6 +82,36 @@ const QUERY_VIEWER: &str = r#"
 query SymphonyLinearViewer {
   viewer {
     id
+  }
+}
+"#;
+
+const MUTATION_CREATE_COMMENT: &str = r#"
+mutation SymphonyCreateComment($issueId: String!, $body: String!) {
+  commentCreate(input: {issueId: $issueId, body: $body}) {
+    success
+  }
+}
+"#;
+
+const MUTATION_UPDATE_STATE: &str = r#"
+mutation SymphonyUpdateIssueState($issueId: String!, $stateId: String!) {
+  issueUpdate(id: $issueId, input: {stateId: $stateId}) {
+    success
+  }
+}
+"#;
+
+const QUERY_RESOLVE_STATE_ID: &str = r#"
+query SymphonyResolveStateId($issueId: String!, $stateName: String!) {
+  issue(id: $issueId) {
+    team {
+      states(filter: {name: {eq: $stateName}}, first: 1) {
+        nodes {
+          id
+        }
+      }
+    }
   }
 }
 "#;
@@ -331,6 +361,98 @@ impl LinearTrackerClient {
         Ok(issues)
     }
 
+    /// Create a comment on a Linear issue.
+    pub async fn create_comment(
+        &self,
+        config: &EffectiveConfig,
+        issue_id: &str,
+        body: &str,
+    ) -> Result<(), TrackerError> {
+        let response = self
+            .graphql(
+                config,
+                MUTATION_CREATE_COMMENT,
+                json!({
+                    "issueId": issue_id,
+                    "body": body,
+                }),
+            )
+            .await?;
+
+        let success = response
+            .pointer("/data/commentCreate/success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        if success {
+            Ok(())
+        } else {
+            Err(TrackerError::CommentCreateFailed)
+        }
+    }
+
+    /// Update a Linear issue's workflow state by name.
+    ///
+    /// Linear requires a state ID, so this first resolves the state name to an
+    /// ID via the issue's team, then performs the update mutation.
+    pub async fn update_issue_state(
+        &self,
+        config: &EffectiveConfig,
+        issue_id: &str,
+        state_name: &str,
+    ) -> Result<(), TrackerError> {
+        let state_id = self.resolve_state_id(config, issue_id, state_name).await?;
+
+        let response = self
+            .graphql(
+                config,
+                MUTATION_UPDATE_STATE,
+                json!({
+                    "issueId": issue_id,
+                    "stateId": state_id,
+                }),
+            )
+            .await?;
+
+        let success = response
+            .pointer("/data/issueUpdate/success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        if success {
+            Ok(())
+        } else {
+            Err(TrackerError::IssueUpdateFailed)
+        }
+    }
+
+    /// Resolve a workflow state name to its Linear ID for the team that owns
+    /// the given issue.
+    async fn resolve_state_id(
+        &self,
+        config: &EffectiveConfig,
+        issue_id: &str,
+        state_name: &str,
+    ) -> Result<String, TrackerError> {
+        let response = self
+            .graphql(
+                config,
+                QUERY_RESOLVE_STATE_ID,
+                json!({
+                    "issueId": issue_id,
+                    "stateName": state_name,
+                }),
+            )
+            .await?;
+
+        response
+            .pointer("/data/issue/team/states/nodes/0/id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| TrackerError::StateNotFound(state_name.to_owned()))
+    }
+
     async fn graphql(
         &self,
         config: &EffectiveConfig,
@@ -373,6 +495,49 @@ impl LinearTrackerClient {
         }
 
         Ok(body)
+    }
+}
+
+impl Tracker for LinearTrackerClient {
+    async fn fetch_candidate_issues(
+        &self,
+        config: &EffectiveConfig,
+    ) -> Result<Vec<Issue>, TrackerError> {
+        self.fetch_candidate_issues(config).await
+    }
+
+    async fn fetch_issues_by_states(
+        &self,
+        config: &EffectiveConfig,
+        states: &[String],
+    ) -> Result<Vec<Issue>, TrackerError> {
+        self.fetch_issues_by_states(config, states).await
+    }
+
+    async fn fetch_issue_states_by_ids(
+        &self,
+        config: &EffectiveConfig,
+        ids: &[String],
+    ) -> Result<Vec<Issue>, TrackerError> {
+        self.fetch_issue_states_by_ids(config, ids).await
+    }
+
+    async fn create_comment(
+        &self,
+        config: &EffectiveConfig,
+        issue_id: &str,
+        body: &str,
+    ) -> Result<(), TrackerError> {
+        self.create_comment(config, issue_id, body).await
+    }
+
+    async fn update_issue_state(
+        &self,
+        config: &EffectiveConfig,
+        issue_id: &str,
+        state_name: &str,
+    ) -> Result<(), TrackerError> {
+        self.update_issue_state(config, issue_id, state_name).await
     }
 }
 
