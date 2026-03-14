@@ -527,6 +527,7 @@ mod tests {
             "state": { "name": "Todo" },
             "branchName": null,
             "url": null,
+            "assignee": { "id": "user-1" },
             "labels": { "nodes": [{ "name": "Bug" }] },
             "inverseRelations": {
                 "nodes": [
@@ -547,8 +548,8 @@ mod tests {
 
         assert_eq!(issue.labels, vec!["bug"]);
         assert_eq!(issue.blocked_by.len(), 1);
-        assert!(issue.assigned_to_worker);
-        assert_eq!(issue.assignee_id, None);
+        assert_eq!(issue.assignee_id.as_deref(), Some("user-1"));
+        assert!(issue.assigned_to_worker); // no filter => assigned_to_worker = true
     }
 
     #[test]
