@@ -554,43 +554,60 @@ mod tests {
 
     #[test]
     fn assignee_filtering_matches_correct_user() {
-        let issue = normalize_issue(&json!({
+        let issue_json = json!({
             "id": "1",
             "identifier": "ABC-1",
             "title": "Test",
+            "description": null,
+            "priority": 2,
             "state": { "name": "Todo" },
-            "assignee": { "id": "user-1" },
+            "branchName": null,
+            "url": null,
+            "assignee": { "id": "user-123" },
+            "labels": { "nodes": [] },
+            "inverseRelations": { "nodes": [] },
             "createdAt": "2026-03-14T00:00:00Z",
             "updatedAt": "2026-03-14T00:00:00Z"
-        }), Some("user-1"))
-        .unwrap();
+        });
+
+        // No filter => assigned_to_worker is true
+        let issue = normalize_issue(&issue_json, None).unwrap();
+        assert!(issue.assigned_to_worker);
+        assert_eq!(issue.assignee_id.as_deref(), Some("user-123"));
+
+        // Matching filter => assigned_to_worker is true
+        let issue = normalize_issue(&issue_json, Some("user-123")).unwrap();
         assert!(issue.assigned_to_worker);
 
-        let issue2 = normalize_issue(&json!({
-            "id": "2",
-            "identifier": "ABC-2",
-            "title": "Test 2",
-            "state": { "name": "Todo" },
-            "assignee": { "id": "user-2" },
-            "createdAt": "2026-03-14T00:00:00Z",
-            "updatedAt": "2026-03-14T00:00:00Z"
-        }), Some("user-1"))
-        .unwrap();
-        assert!(!issue2.assigned_to_worker);
+        // Non-matching filter => assigned_to_worker is false
+        let issue = normalize_issue(&issue_json, Some("user-999")).unwrap();
+        assert!(!issue.assigned_to_worker);
     }
 
     #[test]
     fn assignee_filtering_unassigned_issue() {
-        let issue = normalize_issue(&json!({
+        let issue_json = json!({
             "id": "1",
             "identifier": "ABC-1",
             "title": "Test",
+            "description": null,
+            "priority": 2,
             "state": { "name": "Todo" },
+            "branchName": null,
+            "url": null,
+            "assignee": null,
+            "labels": { "nodes": [] },
+            "inverseRelations": { "nodes": [] },
             "createdAt": "2026-03-14T00:00:00Z",
             "updatedAt": "2026-03-14T00:00:00Z"
-        }), Some("user-1"))
-        .unwrap();
+        });
+
+        // No filter => assigned_to_worker is true
+        let issue = normalize_issue(&issue_json, None).unwrap();
+        assert!(issue.assigned_to_worker);
+
+        // With filter but no assignee => not assigned to worker
+        let issue = normalize_issue(&issue_json, Some("user-123")).unwrap();
         assert!(!issue.assigned_to_worker);
-        assert!(issue.assignee_id.is_none());
     }
 }

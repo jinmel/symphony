@@ -695,7 +695,7 @@ async fn execute_linear_graphql_tool(config: &EffectiveConfig, arguments: Value)
             let has_errors = body
                 .get("errors")
                 .and_then(Value::as_array)
-                .is_some_and(|errors| !errors.is_empty());
+                .map_or(false, |errors: &Vec<Value>| !errors.is_empty());
             let output = serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string());
             json!({
                 "success": !has_errors,
